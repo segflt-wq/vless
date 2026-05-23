@@ -48,6 +48,22 @@ def load_config(path: str) -> dict:
         sys.exit(1)
 
 # ---------------------------------------------------------------------------
+# Find client IPs (multiple — handles dynamic IP changes)
+# ---------------------------------------------------------------------------
+def find_client_ips(lines: list[str], client_sni: str, client_backend: str) -> set[str]:
+    """
+    Возвращает множество всех IP, которые использовали наш SNI+backend.
+    Учитывает смену динамического IP провайдером.
+    """
+    ips = set()
+    for line in lines:
+        parsed = parse_line(line)
+        if parsed and parsed['backend'] == client_backend \
+                  and parsed['sni'] == client_sni:
+            ips.add(parsed['remote'])
+    return ips
+
+# ---------------------------------------------------------------------------
 # Graylist
 # ---------------------------------------------------------------------------
 def _reload_nginx(container: str) -> bool:
@@ -374,7 +390,7 @@ def find_last_ts(lines: list[str]) -> datetime | None:
 # ---------------------------------------------------------------------------
 def analyze_nginx(
     lines:            list[str],
-    client_ip:        str,
+    client_ips:       set[str],
     cfg:              dict,
     networks:         list,
     reputation:       dict,
@@ -406,9 +422,7 @@ def analyze_nginx(
     # Сбор timestamps клиентского трафика
     for line in lines:
         parsed = parse_line(line)
-        if parsed and parsed['remote'] == client_ip \
-                  and parsed['backend'] == client_backend \
-                  and parsed['sni'] == client_sni:
+        if parsed and parsed['remote'] in client_ips and parsed['backend'] == client_backend and parsed['sni'] == client_sni:
             client_times.append(parsed['ts'])
 
     # Анализ чужого трафика
@@ -425,7 +439,8 @@ def analyze_nginx(
         now      = parsed['ts']
         duration = parsed['duration']
 
-        if remote == client_ip:
+        # ✅ FIX: корректная проверка принадлежности к множеству клиентских IP
+        if remote in client_ips:
             continue
         if not is_belarus_ip(remote, networks):
             continue
@@ -448,7 +463,7 @@ def analyze_nginx(
         behavioral_flags = []
 
         rep_bonus = get_reputation_score(reputation, remote)
-        if rep_bonus > 0:
+        if rep_bonus > 0 and remote not in client_ips: 
             score += rep_bonus
             reasons.append(f"reputation(+{rep_bonus})")
             behavioral_flags.append("reputation")
@@ -543,7 +558,7 @@ def get_pcap_files(pcap_dir: str, pattern: str, min_size: int) -> list[str]:
     # Последний файл пропускается намеренно: tcpdump ещё может писать в него
     return files[:-1]
 
-def analyze_pcap(cfg: dict, networks: list, reputation: dict) -> tuple[list[dict], dict]:
+def analyze_pcap(cfg: dict, networks: list, reputation: dict, client_ips: set[str]) -> tuple[list[dict], dict]:
     pcap_cfg        = cfg.get('pcap', {})
     pcap_dir        = pcap_cfg.get('dir', '/var/log/tcpdump')
     pattern         = pcap_cfg.get('pattern', 'tls-*.pcap')
@@ -589,6 +604,11 @@ def analyze_pcap(cfg: dict, networks: list, reputation: dict) -> tuple[list[dict
                             continue
 
                         src_ip = str(ipaddress.ip_address(ip.src))
+                        
+                        # ✅ FIX: исключаем клиентские IP из анализа pcap
+                        if src_ip in client_ips:
+                            continue
+                            
                         if not is_belarus_ip(src_ip, networks):
                             continue
 
@@ -751,12 +771,13 @@ def main():
     else:
         client_sni     = cfg['client']['sni']
         client_backend = cfg['client']['backend']
-        client_ip = find_client_ip(lines, client_sni, client_backend)
-        if client_ip:
-            print(f"[INFO] Client IP: {client_ip}")
+
+        client_ips = find_client_ips(lines, client_sni, client_backend)
+        if client_ips:
+            print(f"[INFO] Client IPs: {', '.join(sorted(client_ips))}")
         else:
-            print("[WARN] Client IP не найден — анализируем весь трафик")
-            client_ip = "__unknown__"
+            print("[WARN] Client IPs не найдены — анализируем весь трафик")
+            client_ips = set()
 
         new_last_ts = find_last_ts(lines)
         if new_last_ts:
@@ -764,7 +785,7 @@ def main():
             print(f"[INFO] State сохранён: {new_last_ts.strftime('%d/%m/%Y %H:%M:%S %z')}")
 
         nginx_results, reputation = analyze_nginx(
-            lines, client_ip, cfg, networks, reputation,
+            lines, client_ips, cfg, networks, reputation,
             perfect_log_path=perfect_log_path,
             by_log_path=by_log_path,
         )
@@ -772,7 +793,8 @@ def main():
               f"подозрительных={len(nginx_results)}")
 
     # ---- Pcap detector ----
-    pcap_results, reputation = analyze_pcap(cfg, networks, reputation)
+    # ✅ FIX: передаём client_ips в analyze_pcap для фильтрации
+    pcap_results, reputation = analyze_pcap(cfg, networks, reputation, client_ips)
     print(f"[INFO] Pcap: подозрительных SYN={len(pcap_results)}")
 
     # ---- Graylist: авто-добавление ----
