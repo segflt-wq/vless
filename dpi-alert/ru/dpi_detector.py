@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DPI scan detector — Россия.
+DPI scan detector.
 Sources: nginx stream log + tcpdump pcap
 Config: /etc/dpi-alert/dpi_detector.yml
 Usage: python3 dpi_detector.py [--config /etc/dpi-alert/dpi_detector.yml]
@@ -18,8 +18,9 @@ import json
 import os
 import glob
 import subprocess
+import copy
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -36,7 +37,7 @@ REPUTATION_FILE = "/var/lib/dpi-alert/reputation.json"
 GRAYLIST_FILE_DEFAULT          = Path("/etc/nginx/graylist.conf")
 GRAYLIST_CONTAINER_DEFAULT     = "nginx_stream"
 SUSPICIOUS_PERFECT_LOG_DEFAULT = "/var/log/dpi-alert/suspicious-perfect.log"
-RU_CONNECTIONS_LOG_DEFAULT     = "/var/log/dpi-alert/ru-connections.log"
+RU_CONNECTIONS_LOG_DEFAULT     = "/var/log/dpi-alert/ru-connections.log"  # 🇷🇺 RU version
 
 def load_config(path: str) -> dict:
     try:
@@ -47,36 +48,25 @@ def load_config(path: str) -> dict:
         sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Fetch RU CIDRs from RIPE (auto-update)
+# Find client IPs (multiple — handles dynamic IP changes)
 # ---------------------------------------------------------------------------
-def fetch_ripe_ru_cidrs() -> list[str] | None:
-    """Скачивает актуальные российские CIDR из официального файла RIPE."""
-    url = "https://ftp.ripe.net/pub/stats/ripencc/membership/alloclist.txt"
-    cidrs = []
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            for line in resp.read().decode().split('\n'):
-                parts = line.split()
-                if len(parts) >= 3 and parts[2] == 'ALLOCATED' and '/' in parts[1]:
-                    # Российские LIR (можно расширять)
-                    if any(line.startswith(f'ru.{lir}') for lir in [
-                        'rt', 'mts', 'megafon', 'beeline', 'vimpelcom',
-                        'domru', 'er-telecom', 'trans-telecom', 'skynet',
-                        'ncnet', 'mailru', 'vk', 'yandex', 'selectel',
-                        'cloudflare-ru', 'internet-invest', 'timeweb',
-                        'reg-ru', 'firstvds', 'aeza', 'vdsina', 'serveroid',
-                        'hostkey', 'maximatelecom', 'firstcolo', 'ddos-guard'
-                    ]):
-                        cidrs.append(parts[1])
-    except Exception as e:
-        print(f"[WARN] Не удалось обновить RU CIDR из RIPE: {e}", file=sys.stderr)
-    return cidrs if cidrs else None
+def find_client_ips(lines: list[str], client_sni: str, client_backend: str) -> set[str]:
+    """
+    Возвращает множество всех IP, которые использовали наш SNI+backend.
+    Учитывает смену динамического IP провайдером.
+    """
+    ips = set()
+    for line in lines:
+        parsed = parse_line(line)
+        if parsed and parsed['backend'] == client_backend \
+                  and parsed['sni'] == client_sni:
+            ips.add(parsed['remote'])
+    return ips
 
 # ---------------------------------------------------------------------------
-# Graylist (только добавление)
+# Graylist
 # ---------------------------------------------------------------------------
 def _reload_nginx(container: str) -> bool:
-    """Graceful reload nginx в контейнере."""
     try:
         subprocess.run(
             ['docker', 'exec', container, 'nginx', '-s', 'reload'],
@@ -92,7 +82,6 @@ def _reload_nginx(container: str) -> bool:
         return False
 
 def _read_graylist(file: Path) -> set[str]:
-    """Читает текущий серый список из файла."""
     ips = set()
     if not file.exists():
         return ips
@@ -121,10 +110,6 @@ def graylist_ip(ip: str, file: Path, container: str) -> bool:
 # Suspicious-perfect logger
 # ---------------------------------------------------------------------------
 def log_suspicious_perfect(log_path: Path, parsed: dict, reasons: list[str], score: int):
-    """
-    Логирует коннекты с правильным SNI, но подозрительным поведением.
-    Формат: JSONL (одна запись на строку) для удобного парсинга.
-    """
     try:
         os.makedirs(log_path.parent, exist_ok=True)
         entry = {
@@ -146,11 +131,11 @@ def log_suspicious_perfect(log_path: Path, parsed: dict, reasons: list[str], sco
         print(f"[WARN] Failed to log suspicious-perfect: {e}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
-# RU connections logger
+# RU connections logger (formerly BY)
 # ---------------------------------------------------------------------------
 def log_ru_connection(log_path: Path, parsed: dict, reason: str):
     """
-    Логирует любой коннект из российских диапазонов который не является
+    Логирует любой коннект из RU-диапазона который не является
     легитимным клиентским трафиком.
     Формат JSONL.
     """
@@ -176,7 +161,6 @@ def log_ru_connection(log_path: Path, parsed: dict, reason: str):
 # Reputation
 # ---------------------------------------------------------------------------
 def load_reputation(path: str) -> dict:
-    """Загружает базу репутации IP."""
     try:
         if os.path.exists(path):
             with open(path) as f:
@@ -186,7 +170,6 @@ def load_reputation(path: str) -> dict:
     return {}
 
 def save_reputation(path: str, rep: dict):
-    """Сохраняет базу репутации IP."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w') as f:
@@ -195,7 +178,8 @@ def save_reputation(path: str, rep: dict):
         print(f"[WARN] Не удалось сохранить репутацию: {e}", file=sys.stderr)
 
 def update_reputation(rep: dict, ip: str, score: int, reasons: list[str]) -> dict:
-    """Обновляет репутацию для IP."""
+    # FIX: deep copy чтобы не мутировать вложенные объекты исходного dict
+    rep = copy.deepcopy(rep)
     now = datetime.now().isoformat()
     if ip not in rep:
         rep[ip] = {
@@ -210,12 +194,10 @@ def update_reputation(rep: dict, ip: str, score: int, reasons: list[str]) -> dic
     rep[ip]['total_score'] += score
     for r in reasons:
         rep[ip]['reasons'][r] = rep[ip]['reasons'].get(r, 0) + 1
-    # Авто-очистка старых записей (>90 дней)
     cutoff = (datetime.now() - timedelta(days=90)).isoformat()
     return {k: v for k, v in rep.items() if v['last_seen'] > cutoff}
 
 def get_reputation_score(rep: dict, ip: str) -> int:
-    """Возвращает бонус к score для известного IP."""
     if ip in rep:
         hits = rep[ip]['hit_count']
         if hits >= 10: return 5
@@ -272,7 +254,7 @@ def format_telegram_message(
         for parsed, reasons in nginx_results:
             by_ip[parsed['remote']].append((parsed, reasons))
         for ip, entries in sorted(by_ip.items(), key=lambda x: -len(x[1])):
-            lines.append(f"  🇷🇺 <b>{ip}</b> ({len(entries)} hits)")
+            lines.append(f"  🇷🇺 <b>{ip}</b> ({len(entries)} hits)")  # 🇷🇺 RU flag
             for parsed, reasons in entries:
                 ts       = parsed['ts'].strftime("%d/%m %H:%M:%S")
                 duration = f"{parsed['duration']:.3f}s" if parsed['duration'] else "?"
@@ -290,7 +272,7 @@ def format_telegram_message(
         for r in pcap_results:
             by_ip[r['src_ip']].append(r)
         for ip, entries in sorted(by_ip.items(), key=lambda x: -len(x[1])):
-            lines.append(f"  🇷🇺 <b>{ip}</b> ({len(entries)} SYN)")
+            lines.append(f"  🇷🇺 <b>{ip}</b> ({len(entries)} SYN)")  # 🇷🇺 RU flag
             for r in entries:
                 ts  = datetime.fromtimestamp(r['ts']).strftime("%d/%m %H:%M:%S")
                 why = " | ".join(r['reasons'])
@@ -309,7 +291,12 @@ def format_telegram_message(
 def load_last_ts(path: str) -> datetime | None:
     try:
         with open(path) as f:
-            return datetime.fromisoformat(f.read().strip())
+            ts = datetime.fromisoformat(f.read().strip())
+            # FIX: если datetime naive (нет timezone offset) — считаем UTC,
+            # чтобы не было TypeError при сравнении с aware datetime из лога
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts
     except (FileNotFoundError, ValueError):
         return None
 
@@ -319,13 +306,12 @@ def save_last_ts(path: str, ts: datetime):
         f.write(ts.isoformat())
 
 # ---------------------------------------------------------------------------
-# IP matching
+# IP matching — 🇷🇺 RU version
 # ---------------------------------------------------------------------------
 def build_networks(cidrs: list[str]) -> list[ipaddress.IPv4Network]:
     return [ipaddress.ip_network(r) for r in cidrs]
 
-def is_russia_ip(ip: str, networks: list) -> bool:
-    """Проверяет принадлежность IP к российским сетям."""
+def is_russia_ip(ip: str, networks: list) -> bool:  # 🇷🇺 Renamed from is_belarus_ip
     try:
         addr = ipaddress.ip_address(ip)
         return any(addr in net for net in networks)
@@ -372,6 +358,8 @@ def read_lines(path: str, last_ts: datetime | None) -> list[str]:
                     result.append(line)
                 else:
                     parsed = parse_line(line)
+                    # FIX: оба datetime теперь aware (last_ts нормализован в load_last_ts),
+                    # сравнение безопасно
                     if parsed and parsed['ts'] > last_ts:
                         result.append(line)
         return result
@@ -402,12 +390,12 @@ def find_last_ts(lines: list[str]) -> datetime | None:
 # ---------------------------------------------------------------------------
 def analyze_nginx(
     lines:            list[str],
-    client_ip:        str,
+    client_ips:       set[str],
     cfg:              dict,
     networks:         list,
     reputation:       dict,
     perfect_log_path: Path | None = None,
-    ru_log_path:      Path | None = None,
+    ru_log_path:      Path | None = None,  # 🇷🇺 Renamed from by_log_path
 ) -> tuple[list[tuple[dict, list[str]]], dict]:
 
     client_sni     = cfg['client']['sni']
@@ -434,9 +422,7 @@ def analyze_nginx(
     # Сбор timestamps клиентского трафика
     for line in lines:
         parsed = parse_line(line)
-        if parsed and parsed['remote'] == client_ip \
-                  and parsed['backend'] == client_backend \
-                  and parsed['sni'] == client_sni:
+        if parsed and parsed['remote'] in client_ips and parsed['backend'] == client_backend and parsed['sni'] == client_sni:
             client_times.append(parsed['ts'])
 
     # Анализ чужого трафика
@@ -453,12 +439,14 @@ def analyze_nginx(
         now      = parsed['ts']
         duration = parsed['duration']
 
-        if remote == client_ip:
+        # ✅ FIX: корректная проверка принадлежности к множеству клиентских IP
+        if remote in client_ips:
             continue
-        if not is_russia_ip(remote, networks):
+        if not is_russia_ip(remote, networks):  # 🇷🇺 RU version
             continue
 
-        # === Лог всех RU-коннектов ===
+        # FIX: логируем ЛЮБОЙ RU-коннект не от клиента, независимо от статуса/SNI/backend.
+        # Причины добавляем для контекста, но запись происходит всегда.
         if ru_log_path:
             ru_reasons = []
             if parsed['status'] != '200':
@@ -467,15 +455,15 @@ def analyze_nginx(
                 ru_reasons.append("backend=fallback")
             if not (sni == client_sni and backend == client_backend):
                 ru_reasons.append("not_client_traffic")
-            if ru_reasons:
-                log_ru_connection(ru_log_path, parsed, " | ".join(ru_reasons))
+            # Всегда пишем — "ok" если нет специфичных причин (чистый коннект с правильным SNI)
+            log_ru_connection(ru_log_path, parsed, " | ".join(ru_reasons) if ru_reasons else "ok")
 
         score            = 0
         reasons          = []
         behavioral_flags = []
 
         rep_bonus = get_reputation_score(reputation, remote)
-        if rep_bonus > 0:
+        if rep_bonus > 0 and remote not in client_ips: 
             score += rep_bonus
             reasons.append(f"reputation(+{rep_bonus})")
             behavioral_flags.append("reputation")
@@ -540,7 +528,7 @@ def analyze_nginx(
             log_suspicious_perfect(perfect_log_path, parsed, behavioral_flags, score)
 
         if score >= score_threshold:
-            reasons.append(f"RU-ALERT score={score}")
+            reasons.append(f"RU-ALERT score={score}")  # 🇷🇺 RU version
             results.append((parsed, reasons))
             updated_rep = update_reputation(updated_rep, remote, score, reasons)
 
@@ -550,7 +538,6 @@ def analyze_nginx(
 # Pcap detector
 # ---------------------------------------------------------------------------
 def get_mss(tcp: dpkt.tcp.TCP) -> int | None:
-    """Извлекаем MSS из TCP options."""
     try:
         opts = dpkt.tcp.parse_opts(tcp.opts)
         for opt_type, opt_data in opts:
@@ -561,10 +548,6 @@ def get_mss(tcp: dpkt.tcp.TCP) -> int | None:
     return None
 
 def get_pcap_files(pcap_dir: str, pattern: str, min_size: int) -> list[str]:
-    """
-    Возвращает завершённые pcap файлы — все кроме самого свежего.
-    Самый свежий файл сейчас пишется tcpdump.
-    """
     files = glob.glob(os.path.join(pcap_dir, pattern))
     if not files:
         return []
@@ -572,14 +555,10 @@ def get_pcap_files(pcap_dir: str, pattern: str, min_size: int) -> list[str]:
     if not files:
         return []
     files.sort(key=os.path.getmtime)
+    # Последний файл пропускается намеренно: tcpdump ещё может писать в него
     return files[:-1]
 
-def analyze_pcap(cfg: dict, networks: list, reputation: dict) -> tuple[list[dict], dict]:
-    """
-    Анализируем завершённые pcap файлы.
-    Возвращаем список подозрительных SYN пакетов от RU-IP.
-    После анализа файлы удаляем.
-    """
+def analyze_pcap(cfg: dict, networks: list, reputation: dict, client_ips: set[str]) -> tuple[list[dict], dict]:
     pcap_cfg        = cfg.get('pcap', {})
     pcap_dir        = pcap_cfg.get('dir', '/var/log/tcpdump')
     pattern         = pcap_cfg.get('pattern', 'tls-*.pcap')
@@ -625,7 +604,12 @@ def analyze_pcap(cfg: dict, networks: list, reputation: dict) -> tuple[list[dict
                             continue
 
                         src_ip = str(ipaddress.ip_address(ip.src))
-                        if not is_russia_ip(src_ip, networks):
+                        
+                        # ✅ FIX: исключаем клиентские IP из анализа pcap
+                        if src_ip in client_ips:
+                            continue
+                            
+                        if not is_russia_ip(src_ip, networks):  # 🇷🇺 RU version
                             continue
 
                         mss    = get_mss(tcp)
@@ -687,13 +671,13 @@ def print_nginx_results(results: list[tuple[dict, list[str]]]):
     by_ip = defaultdict(list)
     for parsed, reasons in results:
         by_ip[parsed['remote']].append((parsed, reasons))
-    print("\n=== NGINX DETECTOR: ПОДОЗРИТЕЛЬНЫЕ RU-IP ===")
+    print("\n=== NGINX DETECTOR: ПОДОЗРИТЕЛЬНЫЕ RU-IP ===")  # 🇷🇺 RU version
     for ip, entries in sorted(by_ip.items(), key=lambda x: -len(x[1])):
-        print(f"\n  🇷🇺 {ip}  ({len(entries)} hits)")
+        print(f"\n  🇷🇺 {ip}  ({len(entries)} hits)")  # 🇷🇺 RU flag
         for parsed, reasons in entries:
             ts       = parsed['ts'].strftime("%d/%m %H:%M:%S")
             duration = f"{parsed['duration']:.3f}s" if parsed['duration'] else "?"
-            why      = " | ".join(r for r in reasons if not r.startswith("RU-"))
+            why      = " | ".join(r for r in reasons if not r.startswith("RU-"))  # 🇷🇺 RU version
             print(f"    {ts}  sni={parsed['sni']:<30}  "
                   f"bytes={parsed['sent']}/{parsed['recv']}  "
                   f"dur={duration}  → {why}")
@@ -702,9 +686,9 @@ def print_pcap_results(results: list[dict]):
     by_ip = defaultdict(list)
     for r in results:
         by_ip[r['src_ip']].append(r)
-    print("\n=== PCAP DETECTOR: ПОДОЗРИТЕЛЬНЫЕ RU-IP ===")
+    print("\n=== PCAP DETECTOR: ПОДОЗРИТЕЛЬНЫЕ RU-IP ===")  # 🇷🇺 RU version
     for ip, entries in sorted(by_ip.items(), key=lambda x: -len(x[1])):
-        print(f"\n  🇷🇺 {ip}  ({len(entries)} SYN)")
+        print(f"\n  🇷🇺 {ip}  ({len(entries)} SYN)")  # 🇷🇺 RU flag
         for r in entries:
             ts  = datetime.fromtimestamp(r['ts']).strftime("%d/%m %H:%M:%S")
             why = " | ".join(r['reasons'])
@@ -716,7 +700,7 @@ def print_pcap_results(results: list[dict]):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="DPI scan detector — Россия")
+    parser = argparse.ArgumentParser(description="DPI scan detector")
     parser.add_argument('--config',        default=DEFAULT_CONFIG, help="Path to config yml")
     parser.add_argument('--graylist-add',  metavar='IP',           help="Добавить IP в серый список")
     parser.add_argument('--graylist-list', action='store_true',    help="Показать серый список")
@@ -724,19 +708,16 @@ def main():
 
     cfg = load_config(args.config)
 
-    # Graylist config
     gl_cfg             = cfg.get('graylist', {})
     graylist_enabled   = gl_cfg.get('enabled', True)
     graylist_file      = Path(gl_cfg.get('file', str(GRAYLIST_FILE_DEFAULT)))
     graylist_container = gl_cfg.get('container', GRAYLIST_CONTAINER_DEFAULT)
 
-    # Suspicious-perfect log config
     sp_cfg           = cfg.get('suspicious_perfect', {})
     perfect_log_path = Path(sp_cfg.get('log_file', SUSPICIOUS_PERFECT_LOG_DEFAULT)) \
                        if sp_cfg.get('enabled', True) else None
 
-    # RU connections log config
-    ru_cfg      = cfg.get('ru_connections', {})
+    ru_cfg      = cfg.get('ru_connections', {})  # 🇷🇺 RU version (was by_connections)
     ru_log_path = Path(ru_cfg.get('log_file', RU_CONNECTIONS_LOG_DEFAULT)) \
                   if ru_cfg.get('enabled', True) else None
 
@@ -759,20 +740,19 @@ def main():
             print(f"❌ Ошибка при добавлении {args.graylist_add}")
         sys.exit(0)
 
-    # Загрузка CIDR: RIPE → fallback на конфиг
-    ripe_cidrs = fetch_ripe_ru_cidrs()
-    if ripe_cidrs:
-        print(f"[INFO] Загружено {len(ripe_cidrs)} CIDR из RIPE")
-        networks = build_networks(ripe_cidrs)
-    else:
-        print("[INFO] Используем локальный список ru_cidrs из конфига")
-        networks = build_networks(cfg['ru_cidrs'])
+    # 🇷🇺 RU version: load russia_cidrs instead of belarus_cidrs
+    networks = build_networks(cfg['russia_cidrs'])
 
     log_file       = cfg['log_file']
     state_file     = cfg.get('state_file', STATE_FILE)
-    client_sni     = cfg['client']['sni']
-    client_backend = cfg['client']['backend']
     rep_file       = cfg.get('reputation_db', REPUTATION_FILE)
+
+    # Поле allowed_asns присутствует в конфиге, но фильтрация по ASN не реализована.
+    # При необходимости — добавить whois/BGP-lookup и сравнение с cfg.get('allowed_asns', [])
+    allowed_asns = cfg.get('allowed_asns', [])
+    if allowed_asns:
+        print(f"[INFO] allowed_asns в конфиге ({len(allowed_asns)} записей) — "
+              f"фильтрация по ASN не реализована, поле игнорируется")
 
     tg_creds   = load_telegram_creds(TELEGRAM_ENV)
     reputation = load_reputation(rep_file)
@@ -790,12 +770,15 @@ def main():
         print("[INFO] Новых строк в nginx логе нет")
         nginx_results = []
     else:
-        client_ip = find_client_ip(lines, client_sni, client_backend)
-        if client_ip:
-            print(f"[INFO] Client IP: {client_ip}")
+        client_sni     = cfg['client']['sni']
+        client_backend = cfg['client']['backend']
+
+        client_ips = find_client_ips(lines, client_sni, client_backend)
+        if client_ips:
+            print(f"[INFO] Client IPs: {', '.join(sorted(client_ips))}")
         else:
-            print("[WARN] Client IP не найден — анализируем весь трафик")
-            client_ip = "__unknown__"
+            print("[WARN] Client IPs не найдены — анализируем весь трафик")
+            client_ips = set()
 
         new_last_ts = find_last_ts(lines)
         if new_last_ts:
@@ -803,15 +786,16 @@ def main():
             print(f"[INFO] State сохранён: {new_last_ts.strftime('%d/%m/%Y %H:%M:%S %z')}")
 
         nginx_results, reputation = analyze_nginx(
-            lines, client_ip, cfg, networks, reputation,
+            lines, client_ips, cfg, networks, reputation,
             perfect_log_path=perfect_log_path,
-            ru_log_path=ru_log_path,
+            ru_log_path=ru_log_path,  # 🇷🇺 RU version
         )
         print(f"[INFO] Nginx: проанализировано строк={len(lines)}, "
               f"подозрительных={len(nginx_results)}")
 
     # ---- Pcap detector ----
-    pcap_results, reputation = analyze_pcap(cfg, networks, reputation)
+    # ✅ FIX: передаём client_ips в analyze_pcap для фильтрации
+    pcap_results, reputation = analyze_pcap(cfg, networks, reputation, client_ips)
     print(f"[INFO] Pcap: подозрительных SYN={len(pcap_results)}")
 
     # ---- Graylist: авто-добавление ----
@@ -846,7 +830,7 @@ def main():
         else:
             print("[WARN] Telegram не настроен — алерт не отправлен")
     else:
-        print("\n[OK] Подозрительных RU-IP не обнаружено")
+        print("\n[OK] Подозрительных RU-IP не обнаружено")  # 🇷🇺 RU version
 
 if __name__ == "__main__":
     main()
